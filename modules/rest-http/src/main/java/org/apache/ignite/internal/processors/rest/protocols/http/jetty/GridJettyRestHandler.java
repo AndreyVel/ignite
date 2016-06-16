@@ -17,34 +17,56 @@
 
 package org.apache.ignite.internal.processors.rest.protocols.http.jetty;
 
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.BeanDescription;
+import com.fasterxml.jackson.databind.BeanProperty;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationConfig;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.module.SimpleModule;
+import com.fasterxml.jackson.databind.ser.BeanSerializerModifier;
+import com.fasterxml.jackson.databind.ser.DefaultSerializerProvider;
+import com.fasterxml.jackson.databind.ser.SerializerFactory;
+import com.fasterxml.jackson.databind.ser.impl.UnknownSerializer;
+import java.beans.IntrospectionException;
+import java.beans.Introspector;
+import java.beans.PropertyDescriptor;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.LineNumberReader;
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import javax.servlet.ServletException;
 import javax.servlet.ServletRequest;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import net.sf.json.JSON;
-import net.sf.json.JSONException;
-import net.sf.json.JSONSerializer;
-import net.sf.json.JsonConfig;
-import net.sf.json.processors.JsonValueProcessor;
+
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.IgniteLogger;
+import org.apache.ignite.internal.processors.cache.query.GridCacheSqlIndexMetadata;
+import org.apache.ignite.internal.processors.cache.query.GridCacheSqlMetadata;
 import org.apache.ignite.internal.processors.rest.GridRestCommand;
 import org.apache.ignite.internal.processors.rest.GridRestProtocolHandler;
 import org.apache.ignite.internal.processors.rest.GridRestResponse;
-import org.apache.ignite.internal.processors.rest.client.message.GridClientTaskResultBean;
 import org.apache.ignite.internal.processors.rest.request.DataStructuresRequest;
 import org.apache.ignite.internal.processors.rest.request.GridRestCacheRequest;
 import org.apache.ignite.internal.processors.rest.request.GridRestLogRequest;
@@ -52,10 +74,17 @@ import org.apache.ignite.internal.processors.rest.request.GridRestRequest;
 import org.apache.ignite.internal.processors.rest.request.GridRestTaskRequest;
 import org.apache.ignite.internal.processors.rest.request.GridRestTopologyRequest;
 import org.apache.ignite.internal.processors.rest.request.RestQueryRequest;
+import org.apache.ignite.internal.util.IgniteExceptionRegistry;
 import org.apache.ignite.internal.util.typedef.F;
 import org.apache.ignite.internal.util.typedef.internal.U;
+import org.apache.ignite.internal.visor.cache.VisorCache;
+import org.apache.ignite.internal.visor.util.VisorExceptionWrapper;
+import org.apache.ignite.lang.IgniteBiTuple;
 import org.apache.ignite.lang.IgniteClosure;
+import org.apache.ignite.lang.IgniteUuid;
 import org.apache.ignite.plugin.security.SecurityCredentials;
+import org.apache.ignite.plugin.security.SecurityPermissionSet;
+import org.apache.ignite.plugin.security.SecuritySubject;
 import org.eclipse.jetty.server.Request;
 import org.eclipse.jetty.server.handler.AbstractHandler;
 import org.jetbrains.annotations.Nullable;
@@ -72,17 +101,6 @@ import static org.apache.ignite.internal.processors.rest.GridRestResponse.STATUS
  * {@code /ignite?cmd=cmdName&param1=abc&param2=123}
  */
 public class GridJettyRestHandler extends AbstractHandler {
-    /** JSON value processor that does not transform input object. */
-    private static final JsonValueProcessor SKIP_STR_VAL_PROC = new JsonValueProcessor() {
-        @Override public Object processArrayValue(Object o, JsonConfig jsonConfig) {
-            return o;
-        }
-
-        @Override public Object processObjectValue(String s, Object o, JsonConfig jsonConfig) {
-            return o;
-        }
-    };
-
     /** Logger. */
     private final IgniteLogger log;
     /** Authentication checker. */
@@ -137,14 +155,13 @@ public class GridJettyRestHandler extends AbstractHandler {
      * @param key Key.
      * @param params Parameters map.
      * @param dfltVal Default value.
-     * @return Long value from parameters map or {@code dfltVal} if null
-     *     or not exists.
+     * @return Long value from parameters map or {@code dfltVal} if null or not exists.
      * @throws IgniteCheckedException If parsing failed.
      */
     @Nullable private static Long longValue(String key, Map<String, Object> params, Long dfltVal) throws IgniteCheckedException {
         assert key != null;
 
-        String val = (String) params.get(key);
+        String val = (String)params.get(key);
 
         try {
             return val == null ? dfltVal : Long.valueOf(val);
@@ -160,17 +177,16 @@ public class GridJettyRestHandler extends AbstractHandler {
      * @param key Key.
      * @param params Parameters map.
      * @param dfltVal Default value.
-     * @return Integer value from parameters map or {@code dfltVal} if null
-     *     or not exists.
+     * @return Integer value from parameters map or {@code dfltVal} if null or not exists.
      * @throws IgniteCheckedException If parsing failed.
      */
-    @Nullable private static Integer intValue(String key, Map<String, Object> params, Integer dfltVal) throws IgniteCheckedException {
+    private static int intValue(String key, Map<String, Object> params, int dfltVal) throws IgniteCheckedException {
         assert key != null;
 
-        String val = (String) params.get(key);
+        String val = (String)params.get(key);
 
         try {
-            return val == null ? dfltVal : Integer.valueOf(val);
+            return val == null ? dfltVal : Integer.parseInt(val);
         }
         catch (NumberFormatException ignore) {
             throw new IgniteCheckedException("Failed to parse parameter of Integer type [" + key + "=" + val + "]");
@@ -182,14 +198,13 @@ public class GridJettyRestHandler extends AbstractHandler {
      *
      * @param key Key.
      * @param params Parameters map.
-     * @return UUID value from parameters map or {@code null} if null
-     *     or not exists.
+     * @return UUID value from parameters map or {@code null} if null or not exists.
      * @throws IgniteCheckedException If parsing failed.
      */
     @Nullable private static UUID uuidValue(String key, Map<String, Object> params) throws IgniteCheckedException {
         assert key != null;
 
-        String val = (String) params.get(key);
+        String val = (String)params.get(key);
 
         try {
             return val == null ? null : UUID.fromString(val);
@@ -208,7 +223,7 @@ public class GridJettyRestHandler extends AbstractHandler {
         InputStream in = getClass().getResourceAsStream("rest.html");
 
         if (in != null) {
-            LineNumberReader rdr = new LineNumberReader(new InputStreamReader(in));
+            LineNumberReader rdr = new LineNumberReader(new InputStreamReader(in, "UTF-8"));
 
             try {
                 StringBuilder buf = new StringBuilder(2048);
@@ -310,6 +325,244 @@ public class GridJettyRestHandler extends AbstractHandler {
         }
     }
 
+    /** Custom {@code null} value serializer. */
+    private static final JsonSerializer<Object> NULL_SERIALIZER = new JsonSerializer<Object>() {
+        /** {@inheritDoc} */
+        @Override public void serialize(Object val, JsonGenerator gen, SerializerProvider ser) throws IOException {
+            gen.writeNull();
+        }
+    };
+
+    /** Custom {@code null} string serializer. */
+    private static final JsonSerializer<Object> NULL_STRING_SERIALIZER = new JsonSerializer<Object>() {
+        /** {@inheritDoc} */
+        @Override public void serialize(Object val, JsonGenerator gen, SerializerProvider ser) throws IOException {
+            gen.writeString("");
+        }
+    };
+
+    /** Custom serializer for {@link Throwable} */
+    private static final JsonSerializer<Throwable> THROWABLE_SERIALIZER = new JsonSerializer<Throwable>() {
+        /** {@inheritDoc} */
+        @Override public void serialize(Throwable e, JsonGenerator gen, SerializerProvider ser) throws IOException {
+            gen.writeStartObject();
+
+            if (e instanceof VisorExceptionWrapper) {
+                VisorExceptionWrapper wrapper = (VisorExceptionWrapper)e;
+
+                gen.writeStringField("className", wrapper.getClassName());
+            }
+            else
+                gen.writeStringField("className", e.getClass().getName());
+
+            if (e.getMessage() != null)
+                gen.writeStringField("message", e.getMessage());
+
+            if (e.getCause() != null)
+                gen.writeObjectField("cause", e.getCause());
+
+            if (e instanceof SQLException) {
+                SQLException sqlE = (SQLException)e;
+
+                gen.writeNumberField("errorCode", sqlE.getErrorCode());
+                gen.writeStringField("SQLState", sqlE.getSQLState());
+            }
+
+            gen.writeEndObject();
+        }
+    };
+
+    /** Custom serializer for {@link IgniteUuid} */
+    private static final JsonSerializer<IgniteUuid> IGNITE_UUID_SERIALIZER = new JsonSerializer<IgniteUuid>() {
+        /** {@inheritDoc} */
+        @Override public void serialize(IgniteUuid uid, JsonGenerator gen, SerializerProvider ser) throws IOException {
+            gen.writeString(uid.toString());
+        }
+    };
+
+    /** Custom serializer for {@link IgniteBiTuple} */
+    private static final JsonSerializer<IgniteBiTuple> IGNITE_TUPLE_SERIALIZER = new JsonSerializer<IgniteBiTuple>() {
+        /** {@inheritDoc} */
+        @Override public void serialize(IgniteBiTuple t, JsonGenerator gen, SerializerProvider ser) throws IOException {
+            gen.writeStartObject();
+
+            gen.writeObjectField("key", t.getKey());
+            gen.writeObjectField("value", t.getValue());
+
+            gen.writeEndObject();
+        }
+    };
+
+    /**
+     * Custom serializer for Visor classes with non JavaBeans getters.
+     */
+    private static final JsonSerializer<Object> LESS_NAMING_SERIALIZER = new JsonSerializer<Object>() {
+        /** Methods to exclude. */
+        private final Collection<String> exclMtds = Arrays.asList("toString", "hashCode", "clone", "getClass");
+
+        /** */
+        private final Map<Class<?>, Collection<Method>> clsCache = new HashMap<>();
+
+        /** */
+        private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+        /** {@inheritDoc} */
+        @Override public void serialize(Object bean, JsonGenerator gen, SerializerProvider ser) throws IOException {
+            if (bean != null) {
+                gen.writeStartObject();
+
+                Class<?> cls = bean.getClass();
+
+                Collection<Method> methods;
+
+                // Get descriptor from cache.
+                rwLock.readLock().lock();
+
+                try {
+                    methods = clsCache.get(cls);
+                }
+                finally {
+                    rwLock.readLock().unlock();
+                }
+
+                // If missing in cache - build descriptor
+                if (methods == null) {
+                    Method[] publicMtds = cls.getMethods();
+
+                    methods = new ArrayList<>(publicMtds.length);
+
+                    for (Method mtd : publicMtds) {
+                        Class retType = mtd.getReturnType();
+
+                        String mtdName = mtd.getName();
+
+                        if (mtd.getParameterTypes().length != 0 ||
+                            retType == void.class || retType == cls ||
+                            exclMtds.contains(mtdName) ||
+                            (VisorCache.class.isAssignableFrom(retType) && "history".equals(mtdName)))
+                            continue;
+
+                        mtd.setAccessible(true);
+
+                        methods.add(mtd);
+                    }
+
+                /*
+                 * Allow multiple puts for the same class - they will simply override.
+                 */
+                    rwLock.writeLock().lock();
+
+                    try {
+                        clsCache.put(cls, methods);
+                    }
+                    finally {
+                        rwLock.writeLock().unlock();
+                    }
+                }
+
+                // Extract fields values using descriptor and build JSONObject.
+                for (Method mtd : methods) {
+                    try {
+                        Object prop = mtd.invoke(bean);
+
+                        if (prop != null)
+                            gen.writeObjectField(mtd.getName(), prop);
+                    }
+                    catch (IOException ioe) {
+                        throw ioe;
+                    }
+                    catch (Exception e) {
+                        throw new IOException(e);
+                    }
+                }
+
+                gen.writeEndObject();
+            }
+        }
+    };
+
+    /** */
+    private static final BeanSerializerModifier CUSTOM_JSON_SERIALIZER_MODIFIER = new BeanSerializerModifier() {
+        /** {@inheritDoc} */
+        @Override public JsonSerializer<?> modifySerializer(SerializationConfig cfg, BeanDescription beanDesc,
+            JsonSerializer<?> serializer) {
+            if (serializer.getClass() == UnknownSerializer.class) {
+                Class<?> beanCls = beanDesc.getBeanClass();
+
+                if ((beanCls.getSimpleName().startsWith("Visor") && beanCls != VisorExceptionWrapper.class) ||
+                    beanCls == IgniteExceptionRegistry.ExceptionInfo.class ||
+                    GridCacheSqlMetadata.class.isAssignableFrom(beanCls) ||
+                    GridCacheSqlIndexMetadata.class.isAssignableFrom(beanCls) ||
+                    SecuritySubject.class.isAssignableFrom(beanCls) ||
+                    SecurityPermissionSet.class.isAssignableFrom(beanCls))
+                    return LESS_NAMING_SERIALIZER;
+
+                try {
+                    PropertyDescriptor[] props = Introspector.getBeanInfo(beanCls).getPropertyDescriptors();
+
+                    if (props == null || (props.length == 1 && props[0].getName().equals("class")))
+                        return LESS_NAMING_SERIALIZER;
+                }
+                catch (IntrospectionException ignore) {
+                    // No-op.
+                }
+            }
+
+            return super.modifySerializer(cfg, beanDesc, serializer);
+        }
+    };
+
+    /**
+     * Custom serializers provider that provide special serializers for {@code null} values.
+     */
+    private static class CustomSerializerProvider extends DefaultSerializerProvider {
+        /**
+         * Default constructor.
+         */
+        CustomSerializerProvider() {
+            super();
+        }
+
+        /**
+         * Full constructor.
+         *
+         * @param src Blueprint object used as the baseline for this instance.
+         * @param cfg Provider configuration.
+         * @param f Serializers factory.
+         */
+        CustomSerializerProvider(SerializerProvider src, SerializationConfig cfg, SerializerFactory f) {
+            super(src, cfg, f);
+        }
+
+        /** {@inheritDoc} */
+        public DefaultSerializerProvider createInstance(SerializationConfig cfg, SerializerFactory jsf) {
+            return new CustomSerializerProvider(this, cfg, jsf);
+        }
+
+        /** {@inheritDoc} */
+        @Override public JsonSerializer<Object> findNullValueSerializer(BeanProperty prop) throws JsonMappingException {
+            if (prop.getType().getRawClass() == String.class)
+                return NULL_STRING_SERIALIZER;
+
+            return NULL_SERIALIZER;
+        }
+    }
+
+    /** */
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper(null, new CustomSerializerProvider(), null);
+
+    static {
+        final SimpleModule module = new SimpleModule();
+
+        module.setSerializerModifier(CUSTOM_JSON_SERIALIZER_MODIFIER);
+
+        module.addSerializer(Throwable.class, THROWABLE_SERIALIZER);
+        module.addSerializer(IgniteBiTuple.class, IGNITE_TUPLE_SERIALIZER);
+        module.addSerializer(IgniteUuid.class, IGNITE_UUID_SERIALIZER);
+
+        JSON_MAPPER.registerModule(module);
+    }
+
     /**
      * Process HTTP request.
      *
@@ -368,39 +621,35 @@ public class GridJettyRestHandler extends AbstractHandler {
                 throw (Error)e;
         }
 
-        JsonConfig cfg = new GridJettyJsonConfig(log);
-
-        // Workaround for not needed transformation of string into JSON object.
-        if (cmdRes.getResponse() instanceof String)
-            cfg.registerJsonValueProcessor(cmdRes.getClass(), "response", SKIP_STR_VAL_PROC);
-
-        // Workaround for not needed transformation of result field string into JSON object at GridClientTaskResultBean.
-        if (cmdRes.getResponse() instanceof GridClientTaskResultBean
-            && ((GridClientTaskResultBean)cmdRes.getResponse()).getResult() instanceof String)
-            cfg.registerJsonValueProcessor(cmdRes.getResponse().getClass(), "result", SKIP_STR_VAL_PROC);
-
-        JSON json;
+        String json;
 
         try {
-            json = JSONSerializer.toJSON(cmdRes, cfg);
+            json = JSON_MAPPER.writeValueAsString(cmdRes);
         }
-        catch (JSONException e) {
-            U.error(log, "Failed to convert response to JSON: " + cmdRes, e);
+        catch (JsonProcessingException e1) {
+            U.error(log, "Failed to convert response to JSON: " + cmdRes, e1);
 
-            json = JSONSerializer.toJSON(new GridRestResponse(STATUS_FAILED, e.getMessage()), cfg);
+            GridRestResponse resFailed = new GridRestResponse(STATUS_FAILED, e1.getMessage());
+
+            try {
+                json = JSON_MAPPER.writeValueAsString(resFailed);
+            }
+            catch (JsonProcessingException e2) {
+                json = "{\"successStatus\": \"1\", \"error:\" \"" + e2.getMessage() + "\"}}";
+            }
         }
 
         try {
             if (log.isDebugEnabled())
-                log.debug("Parsed command response into JSON object: " + json.toString(2));
+                log.debug("Parsed command response into JSON object: " + json);
 
-            res.getWriter().write(json.toString());
+            res.getWriter().write(json);
 
             if (log.isDebugEnabled())
                 log.debug("Processed HTTP request [action=" + act + ", jsonRes=" + cmdRes + ", req=" + req + ']');
         }
         catch (IOException e) {
-            U.error(log, "Failed to send HTTP response: " + json.toString(2), e);
+            U.error(log, "Failed to send HTTP response: " + json, e);
         }
     }
 
@@ -510,10 +759,10 @@ public class GridJettyRestHandler extends AbstractHandler {
             case NODE: {
                 GridRestTopologyRequest restReq0 = new GridRestTopologyRequest();
 
-                restReq0.includeMetrics(Boolean.parseBoolean((String) params.get("mtr")));
-                restReq0.includeAttributes(Boolean.parseBoolean((String) params.get("attr")));
+                restReq0.includeMetrics(Boolean.parseBoolean((String)params.get("mtr")));
+                restReq0.includeAttributes(Boolean.parseBoolean((String)params.get("attr")));
 
-                restReq0.nodeIp((String) params.get("ip"));
+                restReq0.nodeIp((String)params.get("ip"));
 
                 restReq0.nodeId(uuidValue("id", params));
 
@@ -527,12 +776,12 @@ public class GridJettyRestHandler extends AbstractHandler {
             case NOOP: {
                 GridRestTaskRequest restReq0 = new GridRestTaskRequest();
 
-                restReq0.taskId((String) params.get("id"));
-                restReq0.taskName((String) params.get("name"));
+                restReq0.taskId((String)params.get("id"));
+                restReq0.taskName((String)params.get("name"));
 
                 restReq0.params(values("p", params));
 
-                restReq0.async(Boolean.parseBoolean((String) params.get("async")));
+                restReq0.async(Boolean.parseBoolean((String)params.get("async")));
 
                 restReq0.timeout(longValue("timeout", params, 0L));
 
@@ -544,7 +793,7 @@ public class GridJettyRestHandler extends AbstractHandler {
             case LOG: {
                 GridRestLogRequest restReq0 = new GridRestLogRequest();
 
-                restReq0.path((String) params.get("path"));
+                restReq0.path((String)params.get("path"));
 
                 restReq0.from(intValue("from", params, -1));
                 restReq0.to(intValue("to", params, -1));
@@ -569,9 +818,9 @@ public class GridJettyRestHandler extends AbstractHandler {
 
                 restReq0.arguments(values("arg", params).toArray());
 
-                restReq0.typeName((String) params.get("type"));
+                restReq0.typeName((String)params.get("type"));
 
-                String pageSize = (String) params.get("pageSize");
+                String pageSize = (String)params.get("pageSize");
 
                 if (pageSize != null)
                     restReq0.pageSize(Integer.parseInt(pageSize));
@@ -612,7 +861,7 @@ public class GridJettyRestHandler extends AbstractHandler {
             case FETCH_SQL_QUERY: {
                 RestQueryRequest restReq0 = new RestQueryRequest();
 
-                String qryId = (String) params.get("qryId");
+                String qryId = (String)params.get("qryId");
 
                 if (qryId != null)
                     restReq0.queryId(Long.parseLong(qryId));
@@ -632,7 +881,7 @@ public class GridJettyRestHandler extends AbstractHandler {
             case CLOSE_SQL_QUERY: {
                 RestQueryRequest restReq0 = new RestQueryRequest();
 
-                String qryId = (String) params.get("qryId");
+                String qryId = (String)params.get("qryId");
 
                 if (qryId != null)
                     restReq0.queryId(Long.parseLong(qryId));
@@ -659,7 +908,7 @@ public class GridJettyRestHandler extends AbstractHandler {
             restReq.credentials(cred);
         }
 
-        String clientId = (String) params.get("clientId");
+        String clientId = (String)params.get("clientId");
 
         try {
             if (clientId != null)
@@ -669,7 +918,7 @@ public class GridJettyRestHandler extends AbstractHandler {
             // Ignore invalid client id. Rest handler will process this logic.
         }
 
-        String destId = (String) params.get("destId");
+        String destId = (String)params.get("destId");
 
         try {
             if (destId != null)
@@ -679,7 +928,7 @@ public class GridJettyRestHandler extends AbstractHandler {
             // Don't fail - try to execute locally.
         }
 
-        String sesTokStr = (String) params.get("sessionToken");
+        String sesTokStr = (String)params.get("sessionToken");
 
         try {
             if (sesTokStr != null)
@@ -699,7 +948,7 @@ public class GridJettyRestHandler extends AbstractHandler {
      * @param params Parameters map.
      * @return Values.
      */
-    @Nullable protected List<Object> values(String keyPrefix, Map<String, Object> params) {
+    protected List<Object> values(String keyPrefix, Map<String, Object> params) {
         assert keyPrefix != null;
 
         List<Object> vals = new LinkedList<>();
@@ -720,15 +969,14 @@ public class GridJettyRestHandler extends AbstractHandler {
      * @param req Request.
      * @return Command.
      */
-    @Nullable GridRestCommand command(ServletRequest req) {
+    @Nullable private GridRestCommand command(ServletRequest req) {
         String cmd = req.getParameter("cmd");
 
         return cmd == null ? null : GridRestCommand.fromKey(cmd.toLowerCase());
     }
 
     /**
-     * Parses HTTP parameters in an appropriate format and return back map of
-     * values to predefined list of names.
+     * Parses HTTP parameters in an appropriate format and return back map of values to predefined list of names.
      *
      * @param req Request.
      * @return Map of parsed parameters.
