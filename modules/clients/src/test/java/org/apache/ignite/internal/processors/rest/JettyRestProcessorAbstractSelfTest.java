@@ -26,6 +26,7 @@ import java.io.UnsupportedEncodingException;
 import java.net.URL;
 import java.net.URLConnection;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -113,8 +114,11 @@ public abstract class JettyRestProcessorAbstractSelfTest extends AbstractRestPro
     /** Grid count. */
     private static final int GRID_CNT = 3;
 
-    /** Default encoding. */
-    private static final String CHARSET = "UTF-8";
+    /** Url address to send HTTP request. */
+    private final String TEST_URL = "http://" + LOC_HOST + ":" + restPort() + "/ignite?";
+
+    /** Used to sent request charset. */
+    private static final String CHARSET = StandardCharsets.UTF_8.name();
 
     /** JSON to java mapper. */
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
@@ -164,9 +168,7 @@ public abstract class JettyRestProcessorAbstractSelfTest extends AbstractRestPro
      * @throws Exception If failed.
      */
     protected String content(Map<String, String> params) throws Exception {
-        SB sb = new SB();
-
-        sb.a("http://").a(LOC_HOST).a(":").a(restPort()).a("/ignite?");
+        SB sb = new SB(TEST_URL);
 
         for (Map.Entry<String, String> e : params.entrySet())
             sb.a(e.getKey()).a('=').a(e.getValue()).a('&');

@@ -42,6 +42,7 @@ import java.io.InputStreamReader;
 import java.io.LineNumberReader;
 import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -101,6 +102,9 @@ import static org.apache.ignite.internal.processors.rest.GridRestResponse.STATUS
  * {@code /ignite?cmd=cmdName&param1=abc&param2=123}
  */
 public class GridJettyRestHandler extends AbstractHandler {
+    /** Used to sent request charset. */
+    private static final String CHARSET = StandardCharsets.UTF_8.name();
+
     /** Logger. */
     private final IgniteLogger log;
     /** Authentication checker. */
@@ -223,7 +227,7 @@ public class GridJettyRestHandler extends AbstractHandler {
         InputStream in = getClass().getResourceAsStream("rest.html");
 
         if (in != null) {
-            LineNumberReader rdr = new LineNumberReader(new InputStreamReader(in, "UTF-8"));
+            LineNumberReader rdr = new LineNumberReader(new InputStreamReader(in, CHARSET));
 
             try {
                 StringBuilder buf = new StringBuilder(2048);
@@ -232,7 +236,7 @@ public class GridJettyRestHandler extends AbstractHandler {
                     buf.append(line);
 
                     if (!line.endsWith(" "))
-                        buf.append(" ");
+                        buf.append(' ');
                 }
 
                 dfltPage = buf.toString();
@@ -500,7 +504,7 @@ public class GridJettyRestHandler extends AbstractHandler {
                 try {
                     PropertyDescriptor[] props = Introspector.getBeanInfo(beanCls).getPropertyDescriptors();
 
-                    if (props == null || (props.length == 1 && props[0].getName().equals("class")))
+                    if (props == null || (props.length == 1 && "class".equals(props[0].getName())))
                         return LESS_NAMING_SERIALIZER;
                 }
                 catch (IntrospectionException ignore) {
